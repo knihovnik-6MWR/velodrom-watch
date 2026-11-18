@@ -3,48 +3,69 @@
 # (lib/velodrom/watch.ts, app/api/velodrom/robot/watch).
 #
 # It runs from the public repo knihovnik-6MWR/velodrom-watch as
-# .github/workflows/watch.yml (scheduled runs there cost nothing); this copy
-# is the source. It is kept outside .github/ here so it does not run twice.
-# The logs are public: nothing is printed but the app's status code.
+# .github/workflows/watch.yml (runs there cost nothing); this copy is the
+# source. It is kept outside .github/ here so it does not run twice.
+# The logs are public: nothing is printed but the time and the app's
+# status code.
+#
+# GitHub starts scheduled runs late or not at all, so the clock is a chain:
+# each run checks four times, a quarter of an hour apart, then starts the
+# next run itself. The hourly schedule only restarts the chain if it broke
+# (a run that finds the chain going stops at once).
 #
 # Needs the repository secret WATCH_SECRET (the app's VELODROM_WATCH_SECRET).
 name: Velodrom – hlídač Reservanta
 
 on:
   schedule:
-    - cron: '7,22,37,52 * * * *'
+    - cron: '3 * * * *'
   workflow_dispatch:
 
 permissions:
   actions: write
   contents: read
 
-concurrency:
-  group: velodrom-watch
-  cancel-in-progress: false
-
 jobs:
   watch:
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 75
+    env:
+      GH_TOKEN: ${{ github.token }}
+      WATCH_SECRET: ${{ secrets.WATCH_SECRET }}
     steps:
-      - name: Check Reservanto
-        env:
-          WATCH_SECRET: ${{ secrets.WATCH_SECRET }}
+      - name: Is the chain already going?
+        id: chain
+        # The run that started this one is finishing; give it a moment. Of
+        # two runs going at once, the older keeps watching.
         run: |
-          status=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 90 -X POST \
-            https://monkeysledger.xyz/api/velodrom/robot/watch \
-            -H "Authorization: Bearer $WATCH_SECRET")
-          echo "App answered $status"
-          test "$status" = 200
+          sleep 45
+          older=$(gh run list -R "${{ github.repository }}" --workflow watch.yml --status in_progress --json databaseId \
+            -q '[.[] | select(.databaseId < ${{ github.run_id }})] | length')
+          if [ "${older:-0}" -gt 0 ]; then
+            echo "An older run is watching; this one stops."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
 
-      # GitHub turns off schedules in a public repo after 60 days without
-      # activity; switching the workflow on again (once a day) resets that.
-      - name: Keep the schedule alive
-        if: always() && github.event_name == 'schedule'
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Check Reservanto every quarter of an hour
+        if: steps.chain.outputs.skip != 'true'
         run: |
-          if [ "$(date -u +%H)" = "06" ] && [ "$(date -u +%M)" -lt 15 ]; then
+          for round in 1 2 3 4; do
+            status=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 90 -X POST \
+              https://monkeysledger.xyz/api/velodrom/robot/watch \
+              -H "Authorization: Bearer $WATCH_SECRET") || true
+            echo "$(date -u +%H:%M) app answered $status"
+            sleep 900
+          done
+
+      # GitHub turns off workflows in a public repo after 60 days without
+      # activity; switching it on again (once a day) resets that.
+      - name: Keep the workflow alive
+        if: always() && steps.chain.outputs.skip != 'true'
+        run: |
+          if [ "$(date -u +%H)" = "06" ]; then
             gh api -X PUT "repos/${{ github.repository }}/actions/workflows/watch.yml/enable"
           fi
+
+      - name: Start the next run
+        if: always() && steps.chain.outputs.skip != 'true'
+        run: gh workflow run watch.yml -R "${{ github.repository }}" --ref main
