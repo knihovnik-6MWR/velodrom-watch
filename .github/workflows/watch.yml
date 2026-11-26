@@ -13,6 +13,10 @@
 # next run itself. The hourly schedule only restarts the chain if it broke
 # (a run that finds the chain going stops at once).
 #
+# Each answer carries a small `state` the clock passes back with the next
+# check (and on to the next run): while nothing is due and the calendar has
+# not changed, the app reads only Reservanto and leaves the database asleep.
+#
 # Needs the repository secret WATCH_SECRET (the app's VELODROM_WATCH_SECRET).
 name: Velodrom – hlídač Reservanta
 
@@ -20,6 +24,11 @@ on:
   schedule:
     - cron: '3 * * * *'
   workflow_dispatch:
+    inputs:
+      state:
+        description: What the last check handed on (leave empty)
+        required: false
+        default: ''
 
 permissions:
   actions: write
@@ -47,13 +56,25 @@ jobs:
           fi
 
       - name: Check Reservanto every quarter of an hour
+        id: checks
         if: steps.chain.outputs.skip != 'true'
+        env:
+          STATE: ${{ inputs.state }}
         run: |
+          state="$STATE"
           for round in 1 2 3 4; do
-            status=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 90 -X POST \
+            status=$(curl -sS -o answer.json -w '%{http_code}' --max-time 90 -X POST \
               https://monkeysledger.xyz/api/velodrom/robot/watch \
-              -H "Authorization: Bearer $WATCH_SECRET") || true
-            echo "$(date -u +%H:%M) app answered $status"
+              -H "Authorization: Bearer $WATCH_SECRET" -H 'Content-Type: application/json' \
+              -d "$(jq -cn --arg state "$state" '{state: $state}')") || true
+            if [ "$status" = 200 ]; then
+              state=$(jq -r '.state // ""' answer.json)
+              look=$(jq -r 'if .full then "full" else "quick" end' answer.json)
+            else
+              look="-"
+            fi
+            echo "$(date -u +%H:%M) app answered $status ($look)"
+            echo "state=$state" >> "$GITHUB_OUTPUT"
             sleep 900
           done
 
@@ -68,4 +89,6 @@ jobs:
 
       - name: Start the next run
         if: always() && steps.chain.outputs.skip != 'true'
-        run: gh workflow run watch.yml -R "${{ github.repository }}" --ref main
+        env:
+          STATE: ${{ steps.checks.outputs.state }}
+        run: gh workflow run watch.yml -R "${{ github.repository }}" --ref main -f state="$STATE"
